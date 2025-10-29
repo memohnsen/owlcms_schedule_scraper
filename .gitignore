@@ -1,0 +1,5 @@
+/.env
+/csv.csv
+/table.sql
+/venv/
+/__pycache__/
