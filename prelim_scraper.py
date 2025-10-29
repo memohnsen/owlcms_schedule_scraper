@@ -3,6 +3,9 @@
   
   # Run dry-run to preview changes
   source venv/bin/activate && python prelim_scraper.py "https://assets.contentstack.io/v3/assets/blteb7d012fc7ebef7f/blt6510a9b96582ea60/6832224011a22b68335f89f6/2025_-_NCW_-_Preliminary_Schedule_v2_(1).pdf" "Nationals" --dry-run
+  
+  # Export to CSV
+  source venv/bin/activate && python prelim_scraper.py "https://assets.contentstack.io/v3/assets/blteb7d012fc7ebef7f/blt6510a9b96582ea60/6832224011a22b68335f89f6/2025_-_NCW_-_Preliminary_Schedule_v2_(1).pdf" "Nationals" --csv prelim_schedule.csv
 """
 
 import os
@@ -150,6 +153,15 @@ class ScheduleScraper:
                     'date_text': date_for_section
                 })
         
+        # Process rows BEFORE the first header (if any exist)
+        if header_sections and header_sections[0]['start_idx'] > 1:
+            # Parse rows before first header using the same header structure
+            pre_header_rows = table[0:header_sections[0]['start_idx'] - 1]
+            if pre_header_rows:
+                # Don't pass date_text - let it use self.current_date which was carried over from previous table
+                # Pre-header rows are usually continuation from previous page
+                entries.extend(self._parse_with_headers(pre_header_rows, header_sections[0]['header_row'], meet_name, None))
+        
         # Process each section
         if header_sections:
             for i, section in enumerate(header_sections):
@@ -220,6 +232,19 @@ class ScheduleScraper:
         for row in data_rows:
             if not row or all(cell is None or str(cell).strip() == '' for cell in row):
                 continue
+            
+            # Check if this row contains a date (like "Wednesday June 25, 2025")
+            # This can happen when dates appear mid-table without a header
+            row_text = ' '.join([str(cell or '').strip() for cell in row])
+            if any(month in row_text for month in ['January', 'February', 'March', 'April', 'May', 'June', 
+                                                     'July', 'August', 'September', 'October', 'November', 'December']):
+                # Check if this looks like a date row (has day of week)
+                if any(day in row_text for day in ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']):
+                    parsed_date = self._parse_date_from_text(row_text)
+                    if parsed_date:
+                        local_date = parsed_date
+                        self.current_date = parsed_date
+                        continue  # Skip this row, it's just a date header
             
             try:
                 # Use local_date if we found one, otherwise fall back to instance level
@@ -554,16 +579,49 @@ class ScheduleScraper:
             print("No entries to upsert")
             return {'data': [], 'count': 0}
         
-        print(f"Upserting {len(entries)} entries to database...")
+        # Deduplicate entries based on unique constraint
+        seen = {}
+        for entry in entries:
+            key = (entry['meet'], entry['session_id'], entry['platform'], entry['weight_class'])
+            seen[key] = entry
         
-        # Supabase upsert - will insert or update based on unique constraints
+        deduplicated = list(seen.values())
+        
+        if len(deduplicated) < len(entries):
+            print(f"Warning: Removed {len(entries) - len(deduplicated)} duplicate entries from batch")
+        
+        print(f"Upserting {len(deduplicated)} entries to database...")
+        
+        # Unique constraint is meet + session_id + platform + weight_class
         response = self.supabase.table('session_schedule').upsert(
-            entries,
-            on_conflict='date,session_id,platform,weight_class'
+            deduplicated,
+            on_conflict='meet,session_id,platform,weight_class'
         ).execute()
         
-        print(f"Successfully upserted {len(entries)} entries")
+        print(f"Successfully upserted {len(deduplicated)} entries")
         return response
+    
+    def export_to_csv(self, entries: List[Dict], output_file: str):
+        """Export entries to CSV file"""
+        import csv
+        
+        if not entries:
+            print("No entries to export")
+            return
+        
+        print(f"Exporting {len(entries)} entries to {output_file}...")
+        
+        with open(output_file, 'w', newline='') as csvfile:
+            fieldnames = ['id', 'date', 'session_id', 'start_time', 'weigh_in_time', 'platform', 'weight_class', 'meet']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for i, entry in enumerate(entries, 1):
+                # Add id field for CSV (not used in database)
+                row = {'id': i, **entry}
+                writer.writerow(row)
+        
+        print(f"✓ Successfully exported to {output_file}")
     
     def scrape_and_upsert(self, pdf_url: str, meet_name: str, dry_run: bool = False) -> Dict:
         """
@@ -619,17 +677,33 @@ def main():
     parser.add_argument('url', help='URL to the PDF file')
     parser.add_argument('meet_name', help='Name of the meet/competition')
     parser.add_argument('--dry-run', action='store_true', help='Preview changes without actually upserting')
+    parser.add_argument('--csv', help='Export to CSV file instead of database (provide filename)')
     
     args = parser.parse_args()
     
     scraper = ScheduleScraper()
-    result = scraper.scrape_and_upsert(args.url, args.meet_name, dry_run=args.dry_run)
     
-    if result['success']:
-        print("\n✓ Operation completed successfully")
+    if args.csv:
+        # CSV export mode
+        pdf_file = scraper.download_pdf(args.url)
+        raw_entries = scraper.extract_schedule_data(pdf_file, args.meet_name)
+        formatted_entries = scraper.format_for_database(raw_entries)
+        
+        if formatted_entries:
+            scraper.export_to_csv(formatted_entries, args.csv)
+            print("\n✓ CSV export completed successfully")
+        else:
+            print("\n✗ No data to export")
+            exit(1)
     else:
-        print(f"\n✗ Operation failed: {result.get('error', 'Unknown error')}")
-        exit(1)
+        # Database upsert mode
+        result = scraper.scrape_and_upsert(args.url, args.meet_name, dry_run=args.dry_run)
+        
+        if result['success']:
+            print("\n✓ Operation completed successfully")
+        else:
+            print(f"\n✗ Operation failed: {result.get('error', 'Unknown error')}")
+            exit(1)
 
 
 if __name__ == '__main__':
